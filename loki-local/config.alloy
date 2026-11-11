@@ -1,0 +1,41 @@
+local.file_match "microservices" {
+  path_targets = [{
+    __path__ = "/var/log/size-loki/*-service.json",
+    job      = "size-loki",
+    env      = "local",
+  }]
+  sync_period = "5s"
+}
+
+loki.source.file "microservices" {
+  targets    = local.file_match.microservices.targets
+  forward_to = [loki.process.microservices.receiver]
+}
+
+loki.process "microservices" {
+  stage.json {
+    expressions = {
+      service_name = "service.name || \"service.name\"",
+      level        = "log.level || \"log.level\"",
+      timestamp    = "\"@timestamp\"",
+    }
+  }
+  stage.labels {
+    values = {
+      service_name = "",
+      level        = "",
+    }
+  }
+  stage.timestamp {
+    source            = "timestamp"
+    format            = "RFC3339Nano"
+    action_on_failure = "skip"
+  }
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
