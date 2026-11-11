@@ -44,7 +44,7 @@ class RequestLoggingFilterTest {
 
     @ParameterizedTest
     @ValueSource(ints = {200, 302, 400, 404, 503})
-    void classifiesDownstreamResponsesAndPreservesRequestId(int status) {
+    void recordsRawDownstreamStatusAndPreservesRequestId(int status) {
         var response = request(exchange -> {
             assertThat(exchange.getRequest().getHeaders().getFirst("X-Request-ID")).isEqualTo("test-request");
             exchange.getResponse().setStatusCode(HttpStatus.valueOf(status));
@@ -101,12 +101,10 @@ class RequestLoggingFilterTest {
 
     private void assertCompletion(int status) {
         var event = completion();
-        assertThat(event.getLevel()).isEqualTo(status >= 400 ? Level.ERROR : Level.INFO);
+        assertThat(event.getLevel()).isEqualTo(Level.INFO);
         assertThat(fields(event)).containsEntry("status", status)
                 .containsEntry("event_action", "gateway_request_completed")
-                .containsEntry("outcome", status >= 400 ? "error" : "success")
-                .containsEntry("error_type", status >= 500 ? "server_error"
-                        : status >= 400 ? "client_error" : "none");
+                .doesNotContainKeys("outcome", "error_type", "original_level");
     }
 
     private Map<String, Object> fields(ILoggingEvent event) {

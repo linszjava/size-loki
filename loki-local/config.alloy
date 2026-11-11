@@ -20,6 +20,50 @@ loki.process "microservices" {
       timestamp    = "\"@timestamp\"",
     }
   }
+  // Classify only gateway completion events with a valid HTTP status.
+  // Rewrite a parsed JSON object, preserving other fields and JSON escaping.
+  stage.template {
+    source = "cleaned_line"
+    template = `{{- $doc := fromJson .Entry -}}
+{{- if and (kindIs "map" $doc) (eq .service_name "gateway-service") (eq (index $doc "event_action") "gateway_request_completed") -}}
+  {{- $status := printf "%v" (index $doc "status") -}}
+  {{- if regexMatch "^[1-5][0-9]{2}$" $status -}}
+    {{- $code := int $status -}}
+    {{- $level := .level -}}
+    {{- $_ := set $doc "original_level" (default $level (index $doc "original_level")) -}}
+    {{- if ge $code 400 -}}
+      {{- $level = "ERROR" -}}
+      {{- $_ := set $doc "outcome" "error" -}}
+      {{- if ge $code 500 -}}
+        {{- $_ := set $doc "error_type" "server_error" -}}
+      {{- else -}}
+        {{- $_ := set $doc "error_type" "client_error" -}}
+      {{- end -}}
+    {{- else -}}
+      {{- $_ := set $doc "outcome" "success" -}}
+      {{- $_ := set $doc "error_type" "none" -}}
+    {{- end -}}
+    {{- $log := index $doc "log" -}}
+    {{- if kindIs "map" $log -}}
+      {{- $_ := set $log "level" $level -}}
+    {{- else -}}
+      {{- $_ := set $doc "log.level" $level -}}
+    {{- end -}}
+    {{- if hasKey $doc "log.level" -}}{{- $_ := set $doc "log.level" $level -}}{{- end -}}
+    {{- $_ := set $doc "processing_pipeline" "alloy_http_status_v1" -}}
+    {{- toJson $doc -}}
+  {{- else -}}{{ .Entry }}{{- end -}}
+{{- else -}}{{ .Entry }}{{- end -}}`
+  }
+  stage.output {
+    source = "cleaned_line"
+  }
+  // Extract again so the Loki label agrees with the rewritten JSON body.
+  stage.json {
+    expressions = {
+      level = "log.level || \"log.level\"",
+    }
+  }
   stage.labels {
     values = {
       service_name = "",

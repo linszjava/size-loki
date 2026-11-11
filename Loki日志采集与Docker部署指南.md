@@ -57,7 +57,7 @@ Mac 上若 Docker 报挂载目录无权限，检查 Docker Desktop 的文件共�
 
 ## 3. 微服务需要怎么改
 
-已有 JSON 日志配置可以继续使用，无需增加 Loki SDK，也不需要把日志直接推送到 Loki。网关在 Java 中根据最终 HTTP 状态分类并输出日志，Alloy 仅采集解析，见第 8.1 节。修改后的 Java 代码需要重启网关才能生效。
+已有 JSON 日志配置可以继续使用，无需增加 Loki SDK，也不需要把日志直接推送到 Loki。网关只输出原始 INFO 请求完成日志及 HTTP 状态码；分类清洗由 Alloy 完成，见第 8.1 节。修改后的 Java 代码需要重启网关才能生效。
 
 三个服务的 `application.yml` 已配置日志文件。例如订单服务：
 
@@ -153,7 +153,7 @@ stage.json {
 }
 ```
 
-当前标签包含 `job="size-loki"`、`env="local"`、`service_name` 和 `level`，文件采集器也会附带 `filename`。正文保持原样，级别和请求分类字段均来自 Java。时间取自日志的 `@timestamp`，解析失败时保留采集器原来的时间。
+当前标签包含 `job="size-loki"`、`env="local"`、`service_name` 和 `level`，文件采集器也会附带 `filename`。网关完成事件会重写 JSON 的日志级别并补充分类字段，原级别保存在 `original_level`；其他日志正文保持不变。时间取自日志的 `@timestamp`，解析失败时保留采集器原来的时间。
 
 **不要把 requestId、订单号、用户 ID 设为索引标签。** 这些值数量会持续增长，产生大量日志流；保留在正文中，在查询时用 `| json` 提取即可。
 
@@ -288,7 +288,7 @@ tail -n 3 logs/gateway-service.json
   |= "网关请求完成" | json | status >= 400 | __error__=""
 ```
 
-当前 Java 将网关 HTTP 4xx/5xx 完成日志输出为 ERROR，并添加 outcome=error。Alloy 不负责分类，历史日志不会自动修改。
+当前 Alloy 将网关 HTTP 4xx/5xx 完成日志清洗为 ERROR，并写入 `outcome="error"`；Java 原始完成日志仍是 INFO。历史记录不回写，业务过程日志不会因同一个 requestId 而变成 ERROR。跨版本统计可继续使用 `status >= 400`。原项目的 `event.outcome` 不存在，本实验使用 Alloy 生成的顶层 `outcome`。
 
 过去 5 分钟网关失败请求数：
 
@@ -301,42 +301,113 @@ sum(count_over_time(
 
 该统计无需 Prometheus。没有匹配日志时可能显示 No data，而不是数字 0。
 
-## 8.1. v-1.1：由 Java 分类请求结果
+## 8.1. 使用 Alloy 清洗 HTTP 状态码（代替 Logstash）
 
-本版本根据迁移至 Alloy 清洗之前的实现重建。Java 网关使用 WebFilter，覆盖未知网址；在响应提交前读取最终状态。HTTP 4xx/5xx 输出 ERROR、outcome=error，并区分 client_error/server_error；其他响应输出 INFO、outcome=success。
+职责分工：Java 输出事实，Alloy 统一分类，Loki 保存加工后的日志。
 
-Alloy 仅解析 JSON、提取服务名和级别标签、使用原始时间戳并发送到 Loki，不重写日志正文。不存在 original_level 或 processing_pipeline 清洗字段。
+```text
+Java 文件：INFO + status=404
+   → Alloy：解析 → 分类 → 重写 JSON → 重新提取 level 标签
+   → Loki：ERROR + outcome=error + original_level=INFO
+   → Grafana：ERROR 级别和错误结果均可查询
+```
 
-在 IDEA 重启 GatewayApplication，然后发送请求：
+Java 的 `RequestLoggingFilter` 保留 `WebFilter` 和响应提交前记录的机制，保证未知网址、异常处理后的最终 404/500 都能记录。请求开始及完成日志均使用 `log.atInfo()`；完成事件包含 `event_action`、`requestId`、`method`、`path`、`status`、`duration_ms`，不再在 Java 中生成 `outcome` 或 `error_type`。其他业务代码主动输出的 ERROR 日志仍然保留。
+
+清洗入口：[config.alloy](./loki-local/config.alloy) 中的 `loki.process "microservices"`：
+
+1. `stage.json` 提取服务名、原级别和时间。
+2. `stage.template` 用 `fromJson` 解析正文，用 `set` 修改对象、`toJson` 安全序列化，保留其余字段及字符串转义。
+3. `stage.output` 将发送到 Loki 的正文替换为清洗结果，不修改宿主机日志文件。
+4. 再次 `stage.json` 提取清洗后的级别，`stage.labels` 设置一致的 Loki `level` 标签。
+
+规则仅作用于 `service_name=gateway-service` 且 `event_action=gateway_request_completed` 的事件，避免把开始日志、其他业务日志误标为请求结果。
+
+| HTTP 状态 | Alloy outcome | Alloy 日志级别 | error_type |
+|---|---|---|---|
+| 100–399 | success | 保留原级别（当前 Java 为 INFO） | none |
+| 400–499 | error | ERROR | client_error |
+| 500–599 | error | ERROR | server_error |
+| 缺失、无效、范围外 | 不补充 | 不变 | 不补充 |
+
+状态支持数值 `404` 或字符串 `"404"`。非法 JSON、非完成事件原样通过；不会把缺失状态当成成功。`outcome` 表示 HTTP 结果，库存为零但返回 200 仍算 success。
+
+每条处理过的事件增加 `original_level` 和 `processing_pipeline="alloy_http_status_v1"`。已有 `original_level` 时保留，便于检查来源。加工后的正文与标签都为 ERROR，因此展开日志不会再出现“标签 ERROR、正文 INFO”的不一致。
+
+例如原始文件：
+
+```json
+{"service":{"name":"gateway-service"},"log":{"level":"INFO"},"event_action":"gateway_request_completed","status":404,"requestId":"alloy-404-001"}
+```
+
+发送到 Loki 的 JSON（字段顺序可能变化）：
+
+```json
+{"service":{"name":"gateway-service"},"log":{"level":"ERROR"},"event_action":"gateway_request_completed","status":404,"requestId":"alloy-404-001","outcome":"error","error_type":"client_error","original_level":"INFO","processing_pipeline":"alloy_http_status_v1"}
+```
+
+配置里的模板使用 JSON 解析再序列化，不用正则替换整行，以免破坏异常堆栈、引号或换行。Go 模板 JSON 数字解析可能影响超过 2^53 的整数精度，订单号等长标识符应由应用输出为字符串；当前示例使用小整数状态码和字符串 requestId。
+
+### 应用修改并验证
+
+先在 `loki-local` 中校验配置并重启 Alloy：
 
 ```bash
-curl -i http://localhost:8088/api/orders/1001
-curl -i http://localhost:8088/api/orders/1003
-curl -i http://localhost:8088/no-such-url
+docker compose run --rm --no-deps alloy validate /etc/alloy/config.alloy
+docker compose restart alloy
 ```
 
-在 Grafana 查询：
+在 IDEA 重启 `GatewayApplication`，使原始 INFO 输出生效。无需重启 Loki/Grafana。然后发送新请求：
 
-```logql
-{job="size-loki", service_name="gateway-service", level="ERROR"}
+```bash
+curl -i -H 'X-Request-ID: alloy-ok-001' http://localhost:8088/api/orders/1001
+curl -i -H 'X-Request-ID: alloy-product-404-001' http://localhost:8088/api/orders/1003
+curl -i -H 'X-Request-ID: alloy-url-404-001' http://localhost:8088/no-such-url
 ```
 
-或查询失败完成事件：
+在项目根目录比较原始文件：
+
+```bash
+rg 'alloy-product-404-001' logs/gateway-service.json
+```
+
+原始完成日志应是 INFO、status=404，没有 `outcome`。在 Grafana 选择最近 15 分钟，查询同一请求，展开完成事件查看 ERROR、original_level=INFO 和 outcome=error：
 
 ```logql
 {job="size-loki", service_name="gateway-service"}
-  | json | event_action="gateway_request_completed" | outcome="error"
+  | json | requestId="alloy-product-404-001"
+  | event_action="gateway_request_completed"
 ```
 
-本地 JSON 与 Loki 中的级别相同，分类来自 Java。其他服务的过程日志保留原级别。duration_ms 为收到请求至提交响应头的耗时，提交前取消不会产生完成事件。
+仅查询 Alloy 清洗出的错误：
 
-运行网关回归测试：
+```logql
+{job="size-loki", service_name="gateway-service", level="ERROR"}
+  | json | processing_pipeline="alloy_http_status_v1" | outcome="error"
+```
+
+展示请求结果：
+
+```logql
+{job="size-loki", service_name="gateway-service"}
+  | json | event_action="gateway_request_completed"
+  | line_format "{{.outcome}} | {{.status}} | {{.method}} {{.path}} | {{.requestId}}"
+```
+
+每个请求仅完成事件参与分类，其他过程日志不随之改变。历史入库记录不会自动更新。`duration_ms` 是收到请求至提交响应头的耗时；提交前取消的请求不会产生完成事件。直接访问订单或库存端口也不会生成网关完成日志。
+
+### 自动化回归验证
+
+在项目根目录运行：
 
 ```bash
 mvn -o -pl edge/gateway-service -am test
+python3 loki-local/tests/test_pipeline.py
 ```
 
-本版本保留 8 个测试，覆盖响应分类、未知网址、500、默认 200 和 requestId 透传。
+Maven 离线命令需要本地已有依赖，否则移除 `-o`。Alloy 测试需要 Docker 和 `grafana/alloy:v1.19.2` 镜像；使用独立临时容器与日志文件，把实际管道输出到 `loki.echo`，不写入业务 Loki，结束后自动删除容器。
+
+已验证 8 个 Java 用例（原始 INFO、最终状态、未知网址、异常、requestId）和 18 个 Alloy 样例（2xx/3xx、4xx/5xx 边界、字符串状态、无效状态、普通事件、嵌套/扁平字段、非法 JSON），同时检查正文、标签及其他字段保留。
 
 ## 9. 日常维护与排查
 
@@ -368,7 +439,7 @@ docker compose up -d
 
 ## 10. 验证范围与参考资料
 
-本版本为加入 Alloy 清洗前的实现重建，包含 8 个网关测试。切换后应重启网关和 Alloy，再按第 8.1 节联调。
+2026-11-11：Java 的 8 个测试、Alloy v1.19.2 配置校验及 18 个隔离管道样例已通过。运行中的 Java 应用仍需在 IDEA 重启，再按第 8.1 节进行真实业务请求验收。
 
 官方参考（配置编写时核对）：
 

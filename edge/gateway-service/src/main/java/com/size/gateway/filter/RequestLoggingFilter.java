@@ -36,16 +36,12 @@ public class RequestLoggingFilter implements WebFilter, Ordered {
             exchange.getResponse().getHeaders().set("X-Request-ID", requestId);
             HttpStatusCode status = exchange.getResponse().getStatusCode();
             int code = status == null ? 200 : status.value();
-            boolean failed = code >= 400;
-            var event = failed ? log.atError() : log.atInfo();
-            event.addKeyValue("event_action", "gateway_request_completed")
+            // Record facts only; Alloy owns HTTP classification and severity conversion.
+            log.atInfo().addKeyValue("event_action", "gateway_request_completed")
                     .addKeyValue("requestId", requestId)
                     .addKeyValue("method", method)
                     .addKeyValue("path", path)
                     .addKeyValue("status", code)
-                    .addKeyValue("outcome", failed ? "error" : "success")
-                    .addKeyValue("error_type", code >= 500 ? "server_error"
-                            : failed ? "client_error" : "none")
                     .addKeyValue("duration_ms", (System.nanoTime() - start) / 1_000_000)
                     .log("网关请求完成");
             return Mono.empty();
