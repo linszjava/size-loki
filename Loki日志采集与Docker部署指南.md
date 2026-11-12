@@ -57,7 +57,7 @@ Mac 上若 Docker 报挂载目录无权限，检查 Docker Desktop 的文件共�
 
 ## 3. 微服务需要怎么改
 
-已有 JSON 日志配置可以继续使用，无需增加 Loki SDK，也不需要把日志直接推送到 Loki。网关在 Java 中根据最终 HTTP 状态分类并输出日志，Alloy 仅采集解析，见第 8.1 节。修改后的 Java 代码需要重启网关才能生效。
+已有 JSON 日志配置可以继续使用，无需增加 Loki SDK，也不需要把日志直接推送到 Loki。网关在 Java 中以 INFO 输出最终 HTTP 状态等原始字段，不做结果分类，Alloy 仅采集解析，见第 8.1 节。修改后的 Java 代码需要重启网关才能生效。
 
 三个服务的 `application.yml` 已配置日志文件。例如订单服务：
 
@@ -153,7 +153,7 @@ stage.json {
 }
 ```
 
-当前标签包含 `job="size-loki"`、`env="local"`、`service_name` 和 `level`，文件采集器也会附带 `filename`。正文保持原样，级别和请求分类字段均来自 Java。时间取自日志的 `@timestamp`，解析失败时保留采集器原来的时间。
+当前标签包含 `job="size-loki"`、`env="local"`、`service_name` 和 `level`，文件采集器也会附带 `filename`。正文保持原样，级别来自 Java；网关完成日志不包含请求分类字段。时间取自日志的 `@timestamp`，解析失败时保留采集器原来的时间。
 
 **不要把 requestId、订单号、用户 ID 设为索引标签。** 这些值数量会持续增长，产生大量日志流；保留在正文中，在查询时用 `| json` 提取即可。
 
@@ -288,7 +288,7 @@ tail -n 3 logs/gateway-service.json
   |= "网关请求完成" | json | status >= 400 | __error__=""
 ```
 
-当前 Java 将网关 HTTP 4xx/5xx 完成日志输出为 ERROR，并添加 outcome=error。Alloy 不负责分类，历史日志不会自动修改。
+本版本网关完成日志统一为 INFO，即使 status=404/500 也不会自动改成 ERROR。请按 status 查询失败请求，不能仅用 level=ERROR。Alloy 不负责分类，历史日志不会自动修改。
 
 过去 5 分钟网关失败请求数：
 
@@ -301,42 +301,46 @@ sum(count_over_time(
 
 该统计无需 Prometheus。没有匹配日志时可能显示 No data，而不是数字 0。
 
-## 8.1. v-1.1：由 Java 分类请求结果
+## 8.1. v-1.1：原始日志，不做状态码清洗
 
-本版本根据迁移至 Alloy 清洗之前的实现重建。Java 网关使用 WebFilter，覆盖未知网址；在响应提交前读取最终状态。HTTP 4xx/5xx 输出 ERROR、outcome=error，并区分 client_error/server_error；其他响应输出 INFO、outcome=success。
+Java 网关的开始和完成日志都使用 `log.atInfo()`，只记录 requestId、method、path、status、duration_ms 和 event_action。Java 和 Alloy 都不根据状态码转换级别，不添加 outcome、error_type、original_level 或 processing_pipeline。
 
-Alloy 仅解析 JSON、提取服务名和级别标签、使用原始时间戳并发送到 Loki，不重写日志正文。不存在 original_level 或 processing_pipeline 清洗字段。
+保留 WebFilter 和响应提交前读取状态的机制，保证未知网址及异常处理后的最终 404/500 也有记录；这只是记录原始状态，不是分类清洗。其他业务代码主动输出的 ERROR 日志仍保留。
 
-在 IDEA 重启 GatewayApplication，然后发送请求：
+切换到本版本后，必须在 IDEA 重启 GatewayApplication，并在 loki-local 目录执行：
 
 ```bash
-curl -i http://localhost:8088/api/orders/1001
-curl -i http://localhost:8088/api/orders/1003
-curl -i http://localhost:8088/no-such-url
+docker compose exec -T alloy alloy validate /etc/alloy/config.alloy
+docker compose restart alloy
 ```
 
-在 Grafana 查询：
+发送新请求（每次测试更换 requestId）：
 
-```logql
-{job="size-loki", service_name="gateway-service", level="ERROR"}
+```bash
+curl -i -H 'X-Request-ID: raw-product-404-001' http://localhost:8088/api/orders/1004
+curl -i -H 'X-Request-ID: raw-url-404-001' http://localhost:8088/no-such-url
 ```
 
-或查询失败完成事件：
+预期本地文件与 Grafana 的网关完成日志均为 INFO、status=404，没有清洗分类字段。HTTP 响应仍为 404，日志级别不影响响应码。
+
+在 Grafana 选覆盖新请求的时间范围，查询失败完成事件：
 
 ```logql
 {job="size-loki", service_name="gateway-service"}
-  | json | event_action="gateway_request_completed" | outcome="error"
+  | json | event_action="gateway_request_completed" | status >= 400 | __error__=""
 ```
 
-本地 JSON 与 Loki 中的级别相同，分类来自 Java。其他服务的过程日志保留原级别。duration_ms 为收到请求至提交响应头的耗时，提交前取消不会产生完成事件。
+历史日志不会回写：过去的 ERROR、outcome 等字段仍会出现在旧记录中。新规则只影响重新启动后产生并采集的新日志。
 
-运行网关回归测试：
+duration_ms 为收到请求至提交响应头的耗时，提交前取消不会产生完成事件。
+
+运行网关测试：
 
 ```bash
 mvn -o -pl edge/gateway-service -am test
 ```
 
-本版本保留 8 个测试，覆盖响应分类、未知网址、500、默认 200 和 requestId 透传。
+8 个测试覆盖原始 INFO 输出、无分类字段、最终状态、未知网址、500、默认 200 和 requestId 透传。`v-1.2` 则在相同原始日志基础上由 Alloy 执行清洗。
 
 ## 9. 日常维护与排查
 

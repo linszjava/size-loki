@@ -2,7 +2,7 @@
 
 微服务日志实验：Gateway → 订单服务 → 库存服务，通过 Nacos 服务发现，使用 requestId 关联日志。
 
-本版本由 Java 根据 HTTP 状态码生成 ERROR/INFO、outcome 和 error_type。Alloy 只采集、解析及转发 JSON，不执行状态码清洗。这是根据迁移清洗逻辑前的内容重建的基线版本。
+本版本的 Java 网关请求完成日志统一使用 INFO，只记录 status 等原始字段，不添加 outcome 或 error_type。Alloy 只采集、解析及转发 JSON，不执行状态码清洗。因此商品不存在或未知网址返回 404 时，完成日志仍为 INFO。其他业务代码主动记录的 ERROR 不受影响。
 
 环境：JDK 21、Maven 3.9.x、Docker Compose v2，Nacos 单独运行。
 
@@ -10,7 +10,7 @@
 
 ## 版本切换
 
-- `v-1.1`：Java 分类，Alloy 采集。
+- `v-1.1`：Java 原始 INFO 日志，Alloy 仅采集，不分类。
 - `v-1.2`：Java 输出原始日志，Alloy 清洗。
 - `main`：当前版本，与 v-1.2 对应。
 
